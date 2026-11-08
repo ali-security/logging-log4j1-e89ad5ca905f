@@ -1,0 +1,79 @@
+# Upstream log4j 1.2 has no GitHub Actions CI; this workflow reproduces the
+# project's own Maven build (pom.xml), whose `test` phase runs the Ant/JUnit
+# regression suite in tests/build.xml (target runAll) via maven-antrun-plugin.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Ant target(s) from tests/build.xml to run instead of runAll (e.g. Core); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MAVEN_VERSION: 3.6.3
+      MAVEN_OPTS: -Dhttps.protocols=TLSv1.2
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sources/target are 1.4 (maven-compiler-plugin); JDK 7 is the newest JDK
+      # that still compiles -target 1.4 and runs this Maven 2-era plugin set.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "7"
+
+      # Maven 3.6.3 is the last Maven line that runs on Java 7.
+      - name: Install Maven ${{ env.MAVEN_VERSION }}
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Versions
+        run: |
+          java -version
+          mvn -v
+
+      - name: Build and test
+        run: |
+          set -o pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            TARGETS="-Dlog4j.tests.target=${{ inputs.test-filter }}"
+          else
+            TARGETS=""
+          fi
+          mvn -B -e clean verify -Dmaven.site.skip=true $TARGETS 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Test summary
+        if: success() || failure()
+        run: |
+          # Ant's <junit printsummary="yes"> and its plain formatter both print a
+          # "Tests run:" line per suite; count only the formatter's line, which
+          # directly follows "Testsuite: <name>", so each suite counts once.
+          awk '/\[junit\] Testsuite:/ { print; getline; print }' "$RUNNER_TEMP/build.log"
+          awk '/\[junit\] Testsuite:/ { pending = 1; next }
+               pending && /\[junit\] Tests run:/ {
+                 pending = 0;
+                 gsub(",", "");
+                 for (i = 1; i <= NF; i++) {
+                   if ($i == "run:") run += $(i+1);
+                   if ($i == "Failures:") fail += $(i+1);
+                   if ($i == "Errors:") err += $(i+1);
+                 }
+                 suites++
+               }
+               END { printf "TOTAL: %d test suites, %d tests run, %d failures, %d errors, %d passed\n", suites, run, fail, err, run - fail - err }' "$RUNNER_TEMP/build.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: |
+            target/log4j-*.jar
+            !target/log4j-*-sources.jar
+            !target/log4j-*-javadoc.jar
+          if-no-files-found: error
