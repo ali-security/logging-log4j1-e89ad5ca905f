@@ -19,10 +19,15 @@ package org.apache.log4j.net;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InvalidClassException;
+import java.io.InvalidObjectException;
 import java.io.ObjectInputStream;
 import java.io.ObjectStreamClass;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * HardenedObjectInputStream restricts the set of classes that can be
@@ -45,8 +50,41 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 	final List whitelistedClassNames;
 	final static String[] JAVA_PACKAGES = new String[] { "java.lang", "java.util", ARRAY_CLASS_PREFIX + "java.lang" };
 
+	/**
+	 * Maximum number of Map/Collection instances allowed during deserialization
+	 * of a single object graph. This mitigates CVE-2023-26464 where deeply
+	 * nested hash-based collections cause exponential hashCode() computation.
+	 *
+	 * With N collection objects, the worst-case hashCode cost is O(2^(N/2)).
+	 * A limit of 32 bounds this to O(2^16) = ~65K operations.
+	 * A normal LoggingEvent has 1-2 collections (MDC Hashtable, properties).
+	 */
+	static final int MAX_COLLECTION_COUNT = 32;
+
+	/**
+	 * Maximum number of element visits that a hashCode()/equals() call on a
+	 * single deserialized Map, Collection or Map.Entry may require, counting
+	 * the elements of nested Maps, Collections and Map.Entry instances once per
+	 * reference to them. Back-referenced nested containers (e.g. a list holding
+	 * the same list many times, or Map.Entry chains whose key and value are the
+	 * same entry) and virtual collections such as Collections.nCopies() make
+	 * hashCode() exponentially expensive while staying well below
+	 * {@link #MAX_COLLECTION_COUNT}; this bound closes those variants of
+	 * CVE-2023-26464. A normal LoggingEvent only holds a small MDC Hashtable.
+	 */
+	static final int MAX_NESTED_ELEMENT_COUNT = 65536;
+
+	private int collectionCount = 0;
+
+	/**
+	 * Nested element counts of the Maps, Collections and Map.Entry instances
+	 * deserialized so far, keyed by identity so that no hashCode() is invoked.
+	 */
+	private final Map nestedElementCounts = new IdentityHashMap();
+
 	public HardenedObjectInputStream(InputStream in, String[] whilelist) throws IOException {
 		super(in);
+		enableResolveObject(true);
 
 		this.whitelistedClassNames = new ArrayList();
 		if (whilelist != null) {
@@ -58,6 +96,7 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 
 	public HardenedObjectInputStream(InputStream in, List whitelist) throws IOException {
 		super(in);
+		enableResolveObject(true);
 
 		this.whitelistedClassNames = new ArrayList();
 		this.whitelistedClassNames.addAll(whitelist);
@@ -85,6 +124,93 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 				return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Reads an object from the stream, resetting the collection counter
+	 * so that each top-level readObject call gets its own budget.
+	 * Callers should use this instead of {@link #readObject()} directly
+	 * when reading multiple objects from the same stream.
+	 */
+	public Object readAdaptedObject() throws IOException, ClassNotFoundException {
+		collectionCount = 0;
+		nestedElementCounts.clear();
+		try {
+			return readObject();
+		} finally {
+			nestedElementCounts.clear();
+		}
+	}
+
+	/**
+	 * Counts Map and Collection instances during deserialization to prevent
+	 * CVE-2023-26464: deeply nested hash-based collections cause exponential
+	 * hashCode() computation during deserialization.
+	 */
+	protected Object resolveObject(Object obj) throws IOException {
+		if (obj instanceof Map || obj instanceof Collection) {
+			collectionCount++;
+			if (collectionCount > MAX_COLLECTION_COUNT) {
+				throw new InvalidObjectException(
+					"Exceeded maximum number of collection objects during deserialization: "
+					+ MAX_COLLECTION_COUNT
+					+ ". Possible CVE-2023-26464 attack via nested collections.");
+			}
+		}
+		countNestedElements(obj);
+		return super.resolveObject(obj);
+	}
+
+	/**
+	 * Computes how many elements a hashCode()/equals() call on the given
+	 * Map, Collection or Map.Entry would visit, including the elements of the
+	 * nested containers it references, and rejects it when that number exceeds
+	 * {@link #MAX_NESTED_ELEMENT_COUNT}. Nested containers have already been
+	 * resolved (and counted) before the object holding them, so their counts
+	 * are looked up rather than recomputed. Huge (virtual) collections are
+	 * rejected on their size alone, without being iterated.
+	 */
+	private void countNestedElements(Object obj) throws InvalidObjectException {
+		long count = 0;
+		if (obj instanceof Map) {
+			Map map = (Map) obj;
+			checkNestedElementCount(2L * map.size());
+			for (Iterator it = map.entrySet().iterator(); it.hasNext();) {
+				Map.Entry entry = (Map.Entry) it.next();
+				count = checkNestedElementCount(count + 2
+						+ nestedElementCount(entry.getKey())
+						+ nestedElementCount(entry.getValue()));
+			}
+		} else if (obj instanceof Collection) {
+			Collection collection = (Collection) obj;
+			checkNestedElementCount(collection.size());
+			for (Iterator it = collection.iterator(); it.hasNext();) {
+				count = checkNestedElementCount(count + 1 + nestedElementCount(it.next()));
+			}
+		} else if (obj instanceof Map.Entry) {
+			Map.Entry entry = (Map.Entry) obj;
+			count = checkNestedElementCount(2
+					+ nestedElementCount(entry.getKey())
+					+ nestedElementCount(entry.getValue()));
+		}
+		if (count > 0) {
+			nestedElementCounts.put(obj, new Long(count));
+		}
+	}
+
+	private long nestedElementCount(Object element) {
+		Long count = (Long) nestedElementCounts.get(element);
+		return count == null ? 0 : count.longValue();
+	}
+
+	private static long checkNestedElementCount(long count) throws InvalidObjectException {
+		if (count > MAX_NESTED_ELEMENT_COUNT) {
+			throw new InvalidObjectException(
+				"Exceeded maximum number of nested collection elements during deserialization: "
+				+ MAX_NESTED_ELEMENT_COUNT
+				+ ". Possible CVE-2023-26464 attack via nested collections.");
+		}
+		return count;
 	}
 
 	protected void addToWhitelist(List additionalAuthorizedClasses) {
